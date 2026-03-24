@@ -4,11 +4,15 @@ let { uploadImage, uploadExcel } = require('../utils/uploadHandler')
 let path = require('path')
 let exceljs = require('exceljs')
 let fs = require('fs')
+let crypto = require('crypto')
 let categoriesModel = require('../schemas/categories')
 let productsModel = require('../schemas/products')
 let inventoryModel = require('../schemas/inventories')
+let usersModel = require('../schemas/users')
+let rolesModel = require('../schemas/roles')
 let mongoose = require('mongoose')
 let slugify = require('slugify')
+let { sendPasswordMail } = require('../utils/sendMail')
 
 router.post('/one_image', uploadImage.single('file'), function (req, res, next) {
     if (!req.file) {
@@ -154,4 +158,75 @@ router.post('/excel', uploadExcel.single('file'), async function (req, res, next
     }
 })
 
-module.exports = router;
+router.post('/users', uploadExcel.single('file'), async function (req, res, next) {
+    if (!req.file) {
+        return res.status(404).send({ message: "file not found" })
+    }
+    try {
+        let workbook = new exceljs.Workbook()
+        let pathFile = path.join(__dirname, '../uploads', req.file.filename)
+        await workbook.xlsx.readFile(pathFile)
+        let worksheet = workbook.worksheets[0]
+
+        // Tìm role "user"
+        let userRole = await rolesModel.findOne({ name: 'user' })
+        if (!userRole) {
+            fs.unlinkSync(pathFile)
+            return res.status(400).send({ message: "Role 'user' không tồn tại trong DB" })
+        }
+
+        let result = []
+        for (let index = 2; index <= worksheet.rowCount; index++) {
+            const row = worksheet.getRow(index)
+            let username = row.getCell(1).value
+            let email = row.getCell(2).value
+
+            // Bỏ qua dòng rỗng
+            if (!username || !email) {
+                result.push({ row: index, success: false, error: 'username hoặc email bị rỗng' })
+                continue
+            }
+
+            username = String(username).trim()
+            email = String(email).trim()
+
+            // Kiểm tra trùng
+            let existed = await usersModel.findOne({ $or: [{ username }, { email }] })
+            if (existed) {
+                result.push({ row: index, success: false, error: `username hoặc email đã tồn tại: ${username} / ${email}` })
+                continue
+            }
+
+            // Sinh password random 16 ký tự
+            let rawPassword = crypto.randomBytes(12).toString('base64').slice(0, 16)
+
+            try {
+                let newUser = new usersModel({
+                    username,
+                    email,
+                    password: rawPassword,
+                    role: userRole._id,
+                    status: true
+                })
+                await newUser.save()
+
+                // Gửi email
+                await sendPasswordMail(email, username, rawPassword)
+
+                result.push({ row: index, success: true, username, email })
+            } catch (err) {
+                result.push({ row: index, success: false, error: err.message })
+            }
+        }
+
+        fs.unlinkSync(pathFile)
+        res.send({
+            message: `Import hoàn tất: ${result.filter(r => r.success).length} thành công, ${result.filter(r => !r.success).length} thất bại`,
+            result
+        })
+    } catch (err) {
+        next(err)
+    }
+})
+
+module.exports = router;
